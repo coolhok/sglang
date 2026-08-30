@@ -358,6 +358,102 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch.object(overrides_module, "is_cuda", return_value=False):
             self.assertFalse(self._construct(*qwen4).ple_offload_embedding)
 
+    def test_qwen4_h20_fp8_auto_selects_hpc_ops(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        config = {
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "hidden_size": 2560,
+                "moe_intermediate_size": 640,
+                "num_experts": 512,
+                "hidden_act": "silu",
+            },
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+            },
+        }
+        hardware = (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(overrides_module, "is_sm90_supported", return_value=True),
+            patch.object(overrides_module, "get_device_sm", return_value=90),
+            patch.object(
+                overrides_module, "get_device_name", return_value="NVIDIA H20"
+            ),
+            patch.object(overrides_module, "_has_hpc_ops_blockwise", return_value=True),
+        )
+        for item in hardware:
+            item.start()
+            self.addCleanup(item.stop)
+
+        auto = self._construct(*qwen4, config_extra=config)
+        explicit = self._construct(
+            *qwen4,
+            config_extra=config,
+            moe_runner_backend="triton",
+        )
+        unsupported_quant = self._construct(
+            *qwen4,
+            config_extra={
+                **config,
+                "quantization_config": {
+                    **config["quantization_config"],
+                    "weight_block_size": [64, 128],
+                },
+            },
+        )
+        unsupported_a2a = self._construct(
+            *qwen4,
+            config_extra=config,
+            moe_a2a_backend="deepep_normal",
+        )
+        unsupported_activation = self._construct(
+            *qwen4,
+            config_extra={
+                **config,
+                "text_config": {**config["text_config"], "hidden_act": "gelu"},
+            },
+        )
+        unsupported_shape = self._construct(
+            *qwen4,
+            config_extra={
+                **config,
+                "text_config": {
+                    **config["text_config"],
+                    "moe_intermediate_size": 576,
+                },
+            },
+        )
+        unsupported_dtype = self._construct(
+            *qwen4,
+            config_extra=config,
+            dtype="float16",
+        )
+        unsupported_hardware = {}
+        for device_name in ("NVIDIA H100", "NVIDIA H200"):
+            with self.subTest(device_name=device_name), patch.object(
+                overrides_module, "get_device_name", return_value=device_name
+            ):
+                unsupported_hardware[device_name] = self._construct(
+                    *qwen4, config_extra=config
+                )
+        with patch.object(
+            overrides_module, "_has_hpc_ops_blockwise", return_value=False
+        ):
+            missing_package = self._construct(*qwen4, config_extra=config)
+
+        self.assertEqual(auto.moe_runner_backend, "hpc_ops")
+        self.assertEqual(explicit.moe_runner_backend, "triton")
+        self.assertEqual(unsupported_quant.moe_runner_backend, "auto")
+        self.assertEqual(unsupported_a2a.moe_runner_backend, "auto")
+        self.assertEqual(unsupported_activation.moe_runner_backend, "auto")
+        self.assertEqual(unsupported_shape.moe_runner_backend, "auto")
+        self.assertEqual(unsupported_dtype.moe_runner_backend, "auto")
+        for server_args in unsupported_hardware.values():
+            self.assertEqual(server_args.moe_runner_backend, "auto")
+        self.assertEqual(missing_package.moe_runner_backend, "auto")
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(sa.enable_tf32_matmul)  # materialized

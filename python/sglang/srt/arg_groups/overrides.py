@@ -30,6 +30,7 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import inspect
 import json
 import logging
@@ -1375,6 +1376,13 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     ):
         overrides["moe_dense_tp_size"] = None
 
+    if _qwen4_h20_hpc_ops_supported(server_args, hf_config):
+        overrides["moe_runner_backend"] = "hpc_ops"
+        logger.info(
+            "Qwen4-Exp FP8 on H20: moe_runner_backend=hpc_ops "
+            "(H20-optimized fused MoE kernels)."
+        )
+
     from sglang.srt.layers.attention.qsa.config import (
         QSA_VARIANT_COMPRESSED,
         parse_qsa_profile,
@@ -1396,6 +1404,59 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
             "(full//ratio compressed addressing)."
         )
     return overrides
+
+
+def _qwen4_h20_hpc_ops_supported(server_args: Any, hf_config: Any) -> bool:
+    """Whether Qwen4-Exp can safely use HPC-Ops as its auto MoE runner."""
+    import torch
+
+    if (
+        server_args.moe_runner_backend != "auto"
+        or server_args.moe_a2a_backend != "none"
+        or not is_cuda()
+        or not is_sm90_supported()
+        or get_device_sm() != 90
+        or get_device_name().strip().upper() != "NVIDIA H20"
+        or not _has_hpc_ops_blockwise()
+    ):
+        return False
+
+    text_config = getattr(hf_config, "text_config", hf_config)
+    quant_config = getattr(hf_config, "quantization_config", None) or getattr(
+        text_config, "quantization_config", None
+    )
+    if not isinstance(quant_config, dict):
+        return False
+    if (
+        quant_config.get("quant_method") != "fp8"
+        or quant_config.get("activation_scheme") != "dynamic"
+        or quant_config.get("weight_block_size") != [128, 128]
+    ):
+        return False
+
+    hidden_size = getattr(text_config, "hidden_size", 0)
+    moe_intermediate_size = getattr(text_config, "moe_intermediate_size", 0)
+    num_experts = getattr(text_config, "num_experts", 0)
+    return (
+        getattr(text_config, "hidden_act", None) == "silu"
+        and num_experts > 0
+        and hidden_size > 0
+        and hidden_size % 128 == 0
+        and moe_intermediate_size > 0
+        and moe_intermediate_size % 128 == 0
+        and server_args.get_model_config().dtype == torch.bfloat16
+    )
+
+
+def _has_hpc_ops_blockwise() -> bool:
+    """Check the optional package and the exact API selected by this policy."""
+    try:
+        if importlib.util.find_spec("hpc") is None:
+            return False
+        hpc = importlib.import_module("hpc")
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return False
+    return callable(getattr(hpc, "fuse_moe_blockwise", None))
 
 
 @_register_for("InternS2MobiusForConditionalGeneration")
