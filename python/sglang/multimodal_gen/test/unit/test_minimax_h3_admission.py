@@ -238,11 +238,11 @@ class _HopperCapability:
         return 90
 
 
-def _quality_server_args():
+def _quality_server_args(num_gpus=4):
     return SimpleNamespace(
         attention_backend=None,
         model_variant="fl2va",
-        num_gpus=4,
+        num_gpus=num_gpus,
         backend=Backend.AUTO,
         component_attention_backends={},
         enable_breakable_cuda_graph=False,
@@ -252,9 +252,9 @@ def _quality_server_args():
         quantization=None,
         regional_compile=False,
         ring_degree=1,
-        sp_degree=4,
+        sp_degree=num_gpus,
         tp_size=1,
-        ulysses_degree=4,
+        ulysses_degree=num_gpus,
         use_fsdp_inference=False,
     )
 
@@ -282,7 +282,18 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
     )
 
 
-def test_quality_admission_fails_closed_outside_validated_request():
+@pytest.mark.parametrize(
+    ("device_name", "num_gpus"),
+    [
+        ("NVIDIA H200", 4),
+        ("NVIDIA H200", 8),
+        ("NVIDIA H20", 4),
+        ("NVIDIA H20", 8),
+    ],
+)
+def test_quality_admission_accepts_h20_h200_4_and_8_gpu_profiles(
+    device_name, num_gpus
+):
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
             "_minimax_h3": {
@@ -309,12 +320,12 @@ def test_quality_admission_fails_closed_outside_validated_request():
     )
     stage = MiniMaxH3PartitionAdmissionStage(metadata)
     config = MiniMaxH3PipelineConfig()
-    server_args = _quality_server_args()
+    server_args = _quality_server_args(num_gpus)
     server_args.pipeline_config = config
 
     with (
         patch.object(current_platform, "is_cuda", return_value=True),
-        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(current_platform, "get_device_name", return_value=device_name),
         patch.object(
             current_platform,
             "get_device_capability",
@@ -340,6 +351,57 @@ def test_quality_admission_fails_closed_outside_validated_request():
     server_args.attention_backend = None
     with pytest.raises(ValueError, match="quality must be one of"):
         stage.forward(batch, server_args)
+
+
+@pytest.mark.parametrize(
+    ("device_name", "num_gpus", "sp_degree", "ulysses_degree"),
+    [
+        ("NVIDIA H100", 4, 4, 4),
+        ("NVIDIA H20", 2, 2, 2),
+        ("NVIDIA H20", 8, 4, 8),
+        ("NVIDIA H200", 8, 8, 4),
+    ],
+)
+def test_quality_admission_rejects_unsupported_device_or_parallel_topology(
+    device_name, num_gpus, sp_degree, ulysses_degree
+):
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args(num_gpus)
+    server_args.sp_degree = sp_degree
+    server_args.ulysses_degree = ulysses_degree
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value=device_name),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+    ):
+        with pytest.raises(ValueError, match="H20/H200 4-or-8-GPU"):
+            config.validate_quality_deployment(server_args)
+
+
+def test_quality_admission_rejects_mixed_h20_h200_devices():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args(4)
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(
+            current_platform,
+            "get_device_name",
+            side_effect=["NVIDIA H20", "NVIDIA H20", "NVIDIA H200", "NVIDIA H20"],
+        ),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+    ):
+        with pytest.raises(ValueError, match="H20/H200 4-or-8-GPU"):
+            config.validate_quality_deployment(server_args)
 
 
 def test_validate_server_args_requires_packed_varlen_backend():

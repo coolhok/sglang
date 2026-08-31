@@ -31,6 +31,29 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 
 
+# Cache-DiT's H3 quality="high" policy is admitted only on these resident,
+# Hopper-family deployment profiles. Keep this as an explicit matrix rather
+# than accepting arbitrary SM90 devices: the quality contract is model and
+# topology specific.
+_MINIMAX_H3_HIGH_QUALITY_PROFILES = frozenset(
+    {
+        ("h20", 4),
+        ("h20", 8),
+        ("h200", 4),
+        ("h200", 8),
+    }
+)
+
+
+def _minimax_h3_gpu_family(device_name: str) -> str | None:
+    normalized = device_name.upper()
+    if "H200" in normalized:
+        return "h200"
+    if "H20" in normalized:
+        return "h20"
+    return None
+
+
 @dataclass
 class MiniMaxH3PipelineConfig(PipelineConfig):
     """MiniMax H3 native audio-video pipeline configuration."""
@@ -102,12 +125,24 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             if attention_backend is not None
             else None
         )
-        capability = current_platform.get_device_capability()
-        capability_int = capability.to_int() if capability is not None else None
-        device_name = (
-            current_platform.get_device_name()
-            if current_platform.is_cuda()
-            else type(current_platform).__name__
+        # This stage executes in each rank, but all resident GPUs are visible
+        # through NVML. Inspect every selected logical device so a mixed H20 /
+        # H200 host cannot accidentally pass by looking at rank 0 only.
+        device_ids = range(server_args.num_gpus)
+        if current_platform.is_cuda():
+            device_names = tuple(
+                current_platform.get_device_name(device_id) for device_id in device_ids
+            )
+            capabilities = tuple(
+                current_platform.get_device_capability(device_id)
+                for device_id in range(server_args.num_gpus)
+            )
+        else:
+            device_names = (type(current_platform).__name__,)
+            capabilities = (None,)
+        capability_ints = tuple(
+            capability.to_int() if capability is not None else None
+            for capability in capabilities
         )
         model_variant = str(server_args.model_variant or "fl2va").lower()
         actual = {
@@ -141,14 +176,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
             "model_variant": "fl2va",
-            "num_gpus": 4,
             "performance_mode": "speed",
             "quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
-            "sp_degree": 4,
             "tp_size": 1,
-            "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
         mismatches = {
@@ -160,19 +192,45 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 else actual[name] != wanted
             )
         }
+        gpu_families = frozenset(
+            _minimax_h3_gpu_family(device_name) for device_name in device_names
+        )
+        profile = (
+            (next(iter(gpu_families)), server_args.num_gpus)
+            if len(gpu_families) == 1
+            else None
+        )
+        supported_topology = (
+            server_args.sp_degree == server_args.num_gpus
+            and server_args.ulysses_degree == server_args.num_gpus
+        )
         if (
             not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
+            or any(capability_int != 90 for capability_int in capability_ints)
+            or profile not in _MINIMAX_H3_HIGH_QUALITY_PROFILES
+            or not supported_topology
         ):
-            mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
-                "actual": f"{device_name} (compute capability {capability_int})",
+            mismatches["quality_high_profile"] = {
+                "expected": (
+                    "NVIDIA H20 or H200 (compute capability 9.0), 4 or 8 GPUs, "
+                    "and SP/Ulysses equal to num_gpus"
+                ),
+                "actual": {
+                    "devices": [
+                        f"{device_name} (compute capability {capability_int})"
+                        for device_name, capability_int in zip(
+                            device_names, capability_ints
+                        )
+                    ],
+                    "num_gpus": server_args.num_gpus,
+                    "sp_degree": server_args.sp_degree,
+                    "ulysses_degree": server_args.ulysses_degree,
+                },
             }
         if mismatches:
             raise ValueError(
                 'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                f"the H20/H200 4-or-8-GPU fl2va profiles; mismatches: {mismatches}"
             )
 
     def validate_server_args(self, server_args) -> None:
