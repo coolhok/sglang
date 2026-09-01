@@ -179,6 +179,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         actual["component_attention_backends"] = dict(
             server_args.component_attention_backends or {}
         )
+        # The original audit covered the H200 4-way Ulysses topology. B200
+        # runs on the same native H3 path, but the B200 validation matrix also
+        # covers the 4- and 8-way Ulysses topologies. Some B200 environments
+        # report a virtualized product name, so use SM100 rather than a device
+        # name for this admission check.
+        is_blackwell = capability_int == 100
+        allowed_num_gpus = {4, 8} if is_blackwell else {4}
         expected = {
             "attention_backend": {None, "fa"},
             "backend": {"auto", "sglang"},
@@ -187,16 +194,16 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
             "model_variant": "fl2va",
-            "num_gpus": 4,
+            "num_gpus": allowed_num_gpus,
             "performance_mode": "speed",
             "quantization": None,
             "transformer_weights_path": None,
             "text_encoder_quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
-            "sp_degree": 4,
+            "sp_degree": server_args.num_gpus,
             "tp_size": 1,
-            "ulysses_degree": 4,
+            "ulysses_degree": server_args.num_gpus,
             "use_fsdp_inference": False,
         }
         mismatches = {
@@ -208,19 +215,20 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 else actual[name] != wanted
             )
         }
-        if (
-            not current_platform.is_cuda()
-            or "H200" not in device_name.upper()
-            or capability_int != 90
-        ):
+        is_h200 = "H200" in device_name.upper() and capability_int == 90
+        if not current_platform.is_cuda() or not (is_h200 or is_blackwell):
             mismatches["device"] = {
-                "expected": "NVIDIA H200 (compute capability 9.0)",
+                "expected": (
+                    "NVIDIA H200 (compute capability 9.0) or Blackwell "
+                    "(compute capability 10.0)"
+                ),
                 "actual": f"{device_name} (compute capability {capability_int})",
             }
         if mismatches:
             raise ValueError(
                 'MiniMax-H3 quality="high" is validated only for '
-                f"the strict 4xH200 fl2va deployment; mismatches: {mismatches}"
+                "the 4xH200 or 4x/8x Blackwell fl2va deployments; "
+                f"mismatches: {mismatches}"
             )
 
     def validate_server_args(self, server_args) -> None:

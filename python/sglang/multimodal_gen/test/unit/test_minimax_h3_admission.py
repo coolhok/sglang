@@ -286,6 +286,11 @@ class _HopperCapability:
         return 90
 
 
+class _BlackwellCapability:
+    def to_int(self) -> int:
+        return 100
+
+
 def _quality_server_args():
     return SimpleNamespace(
         attention_backend=None,
@@ -322,6 +327,57 @@ def test_high_quality_deployment_rejects_transformer_weight_override():
             return_value=_HopperCapability(),
         ),
         pytest.raises(ValueError, match="transformer_weights_path"),
+    ):
+        config.validate_quality_deployment(server_args)
+
+
+@pytest.mark.parametrize(
+    ("device_name", "capability", "num_gpus"),
+    [
+        ("NVIDIA H200", _HopperCapability(), 4),
+        ("NVIDIA B200", _BlackwellCapability(), 4),
+        # B200 may be exposed with a virtualized product name, while SM100
+        # remains the reliable device identity.
+        ("NVIDIA L20C", _BlackwellCapability(), 8),
+    ],
+)
+def test_high_quality_deployment_accepts_audited_hopper_and_blackwell_topologies(
+    device_name, capability, num_gpus
+):
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.num_gpus = num_gpus
+    server_args.sp_degree = num_gpus
+    server_args.ulysses_degree = num_gpus
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value=device_name),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=capability,
+        ),
+    ):
+        config.validate_quality_deployment(server_args)
+
+
+def test_high_quality_deployment_rejects_blackwell_without_full_ulysses():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.num_gpus = 8
+    server_args.sp_degree = 4
+    server_args.ulysses_degree = 4
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA B200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_BlackwellCapability(),
+        ),
+        pytest.raises(ValueError, match="sp_degree"),
     ):
         config.validate_quality_deployment(server_args)
 
