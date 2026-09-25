@@ -17,6 +17,122 @@ RANK = 1024
 N_OUT = GROUPS * RANK
 SCALE_BYTES = 8192
 MAX_M = 32
+SM90_MAX_M = 2
+
+
+@triton.jit
+def _fused_rope_wo_a_bf16_sm90_kernel(
+    X,
+    W,
+    FREQS,
+    POSITIONS,
+    Y,
+    stride_xt,
+    stride_xg,
+    stride_wg,
+    stride_wr,
+    stride_wd,
+    stride_yt,
+    stride_yg,
+    stride_yr,
+    R: tl.constexpr,
+    D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token = tl.program_id(0)
+    row_block = tl.program_id(1)
+    group = tl.program_id(2)
+    rows = row_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    columns = tl.arange(0, D)
+
+    x = tl.load(X + token * stride_xt + group * stride_xg + columns).to(tl.float32)
+    head_column = columns % HEAD_DIM
+    rope_column = head_column - (HEAD_DIM - ROPE_DIM)
+    is_rope = rope_column >= 0
+    partner = tl.load(
+        X + token * stride_xt + group * stride_xg + (columns ^ 1),
+        mask=is_rope,
+        other=0.0,
+    ).to(tl.float32)
+    pair = tl.where(is_rope, rope_column // 2, 0)
+    position = tl.load(POSITIONS + token)
+    freq_offsets = position * ROPE_DIM + pair * 2
+    cosine = tl.load(FREQS + freq_offsets, mask=is_rope, other=1.0)
+    sine = tl.load(FREQS + freq_offsets + 1, mask=is_rope, other=0.0)
+    rotated = tl.where(
+        (rope_column & 1) == 0,
+        x * cosine + partner * sine,
+        x * cosine - partner * sine,
+    )
+    # Match the unfused path's BF16 materialization between inverse RoPE and WO-A.
+    x = tl.where(is_rope, rotated.to(tl.bfloat16), x).to(tl.float32)
+
+    weight = tl.load(
+        W
+        + group * stride_wg
+        + rows[:, None] * stride_wr
+        + columns[None, :] * stride_wd,
+        mask=rows[:, None] < R,
+        other=0.0,
+    ).to(tl.float32)
+    result = tl.sum(weight * x[None, :], axis=1)
+    tl.store(
+        Y + token * stride_yt + group * stride_yg + rows * stride_yr,
+        result,
+        mask=rows < R,
+    )
+
+
+def fused_rope_wo_a_bf16_sm90(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Inverse RoPE + grouped BF16 WO-A for the DSV4.1 TP8 decode shape."""
+    assert x.ndim == weight.ndim == 3
+    assert x.dtype == weight.dtype == torch.bfloat16
+    assert freqs_cis.dtype == torch.float32 and freqs_cis.ndim == 2
+    assert positions.dtype in (torch.int32, torch.int64) and positions.ndim == 1
+    assert x.is_cuda and x.device == weight.device == freqs_cis.device
+    assert x.device == positions.device
+    tokens, groups, dim = x.shape
+    weight_groups, rows, weight_dim = weight.shape
+    assert 0 < tokens <= SM90_MAX_M
+    assert positions.shape[0] == tokens
+    assert (groups, rows, dim) == (1, 1024, 4096)
+    assert (weight_groups, weight_dim) == (groups, dim)
+    assert freqs_cis.shape[1] == 64
+    assert freqs_cis.is_contiguous() and positions.is_contiguous()
+    assert x.stride(2) == weight.stride(2) == 1
+
+    output = torch.empty((tokens, groups, rows), dtype=x.dtype, device=x.device)
+    block_n = 4
+    _fused_rope_wo_a_bf16_sm90_kernel[(tokens, triton.cdiv(rows, block_n), groups)](
+        x,
+        weight,
+        freqs_cis,
+        positions,
+        output,
+        x.stride(0),
+        x.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        R=rows,
+        D=dim,
+        HEAD_DIM=512,
+        ROPE_DIM=64,
+        BLOCK_N=block_n,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return output
 
 
 @cache_once

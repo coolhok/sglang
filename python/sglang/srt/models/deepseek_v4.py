@@ -33,7 +33,11 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import (
+    SM90_MAX_M as _SM90_FUSED_WO_A_MAX_TOKENS,
+)
+from sglang.kernels.ops.attention.dsv4.wo_a import (
     fused_rope_wo_a_bf16,
+    fused_rope_wo_a_bf16_sm90,
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
@@ -1178,15 +1182,21 @@ class MQALayer(MqaAttentionBase):
         )
         # Static eligibility; token count and wo_b's output format are checked
         # in forward, after weights have loaded.
+        fused_wo_a_shape_supported = (
+            _fused_wo_a_arch_supported()
+            and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+        ) or (
+            get_platform().is_sm90
+            and (self.n_local_groups, self.o_lora_rank) == (1, 1024)
+        )
         self.use_fused_wo_a = (
             self.is_dsv41
             and envs.SGLANG_DSV41_FUSED_WO_A.get()
-            and _fused_wo_a_arch_supported()
             and not self.wo_a_fp8
             and not self.use_npu_arch35_mxfp8_wo_a
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
-            and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+            and fused_wo_a_shape_supported
         )
 
         # KV cache write is always fused into the K kernel
@@ -2390,8 +2400,15 @@ class MQALayer(MqaAttentionBase):
             fuse_mxfp8_quant = (
                 self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
             )
+            fuse_sm90_rope_wo_a = (
+                self.use_fused_wo_a
+                and get_platform().is_sm90
+                and 0 < o.shape[0] <= _SM90_FUSED_WO_A_MAX_TOKENS
+            )
             fuse_rope_wo_a = (
-                self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+                self.use_fused_wo_a
+                and not get_platform().is_sm90
+                and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
             if _is_npu:
@@ -2405,7 +2422,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif not fuse_rope_wo_a:
+            elif not (fuse_rope_wo_a or fuse_sm90_rope_wo_a):
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
@@ -2417,7 +2434,15 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if fuse_rope_wo_a:
+            if fuse_sm90_rope_wo_a:
+                wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                o = fused_rope_wo_a_bf16_sm90(
+                    o,
+                    wo_a,
+                    torch.view_as_real(self.freqs_cis).flatten(1),
+                    positions,
+                )
+            elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 out = fused_rope_wo_a_bf16(
                     o,
