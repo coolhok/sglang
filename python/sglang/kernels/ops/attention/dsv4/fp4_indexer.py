@@ -427,7 +427,86 @@ def _e2m1_decode(code):
     sub = m * 0.5
     nor = (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32))
     v = tl.where(e == 0, sub, nor)
-    return tl.where((code >> 3) == 1, -v, v)
+    # Set the sign bit directly so the e2m1 negative-zero code stays -0.0.
+    bits = v.to(tl.uint32, bitcast=True)
+    bits |= ((code >> 3).to(tl.uint32)) << 31
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _dequant_fp4_index_k_cache_kernel(
+    cache,
+    slots,
+    output,
+    num_rows,
+    cache_stride,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    pair = tl.arange(0, INDEX_K_PAYLOAD_BYTES)
+    valid = row[:, None] < num_rows
+    slot = tl.load(slots + row, mask=row < num_rows, other=0).to(tl.int64)
+    page = slot // PAGE_SIZE
+    page_offset = slot % PAGE_SIZE
+    row_base = page * cache_stride
+
+    packed = tl.load(
+        cache
+        + row_base[:, None]
+        + page_offset[:, None] * INDEX_K_PAYLOAD_BYTES
+        + pair[None, :],
+        mask=valid,
+        other=0,
+    )
+    exponent = tl.load(
+        cache
+        + row_base[:, None]
+        + PAGE_SIZE * INDEX_K_PAYLOAD_BYTES
+        + page_offset[:, None] * INDEX_K_SCALE_BYTES
+        + (pair // 16)[None, :],
+        mask=valid,
+        other=127,
+    )
+    scale = tl.exp2(exponent.to(tl.float32) - 127.0)
+    low = (_e2m1_decode(packed & 0x0F) * scale).to(tl.bfloat16)
+    high = (_e2m1_decode(packed >> 4) * scale).to(tl.bfloat16)
+    output_ptr = output + row[:, None] * 128 + 2 * pair[None, :]
+    tl.store(output_ptr, low, mask=valid)
+    tl.store(output_ptr + 1, high, mask=valid)
+
+
+def dequant_fp4_index_k_cache(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    *,
+    page_size: int,
+) -> torch.Tensor:
+    """Gather and dequantize paged FP4 index-K rows into BF16."""
+    assert cache.is_cuda and slots.is_cuda
+    assert cache.dtype == torch.uint8 and cache.ndim == 2
+    assert slots.dtype in (torch.int32, torch.int64) and slots.ndim == 1
+    assert cache.device == slots.device
+    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
+
+    slots = slots.contiguous()
+    num_rows = slots.numel()
+    output = torch.empty(
+        (num_rows, INDEX_HEAD_DIM), device=cache.device, dtype=torch.bfloat16
+    )
+    if num_rows > 0:
+        block_m = 4
+        _dequant_fp4_index_k_cache_kernel[(triton.cdiv(num_rows, block_m),)](
+            cache,
+            slots,
+            output,
+            num_rows,
+            cache.stride(0),
+            PAGE_SIZE=page_size,
+            BLOCK_M=block_m,
+            num_warps=4,
+        )
+    return output
 
 
 @triton.jit

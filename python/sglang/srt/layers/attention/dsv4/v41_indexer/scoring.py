@@ -240,14 +240,14 @@ class RequestScores(msgspec.Struct, frozen=True):
     lc: int  # compressed positions visible at its newest row
     k: int
     columns: torch.Tensor  # arange(lc)
-    tok: torch.Tensor  # [rows_b] its query rows in the chunk
+    tok: slice  # its consecutive query rows in the chunk
     lens: torch.Tensor  # [rows_b] compressed positions each row sees
     slots: torch.Tensor  # [lc] index-K pool slot of each position
 
 
 class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
-    tok: torch.Tensor
+    tok: slice  # into the batch's rows
     lens: torch.Tensor
     scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
 
@@ -271,22 +271,43 @@ def prefill_requests(
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
-    req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    pos = inputs.positions
+    rows_per_request = inputs.rows_per_request
+    seq_lens_cpu = inputs.seq_lens_cpu
+    assert rows_per_request is not None and seq_lens_cpu is not None, (
+        "the torch indexer needs the CPU length vectors"
+    )
+    assert len(rows_per_request) == len(seq_lens_cpu)
     out.reset()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
-    for r in torch.unique_consecutive(req).tolist():
-        tok = (req == r).nonzero().squeeze(1)
+    row_start = 0
+    req_pool_indices = inputs.req_pool_indices.to(torch.int64)
+    # Prefill rows are consecutive per request; CPU metadata owns that partition.
+    for request_idx, (num_rows, seq_len) in enumerate(
+        zip(rows_per_request, seq_lens_cpu)
+    ):
+        tok = slice(row_start, row_start + num_rows)
+        row_start += num_rows
+        if num_rows == 0:
+            continue
         lens = compress_lens[tok]
-        lc = int(lens.max().item())
+        lc = seq_len // ratio
         if lc == 0:
             continue
         j = torch.arange(lc, device=pos.device)
-        slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
+        slots = (
+            req_to_token[
+                req_pool_indices[request_idx : request_idx + 1, None],
+                (j * ratio)[None, :],
+            ]
+            .squeeze(0)
+            .to(torch.int64)
+            // ratio
+        )
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         request = RequestScores(
@@ -298,6 +319,7 @@ def prefill_requests(
                 indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
             ),
         )
+    assert row_start == pos.shape[0]
 
 
 def _score_chunks(
@@ -308,14 +330,16 @@ def _score_chunks(
     index_k: torch.Tensor,
     request: RequestScores,
 ) -> Iterator[ChunkScores]:
-    lc, j = request.lc, request.columns
+    lc = request.lc
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
-    for start in range(0, request.tok.numel(), rows_per_chunk):
-        rows = slice(start, start + rows_per_chunk)
-        tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+    num_rows = request.tok.stop - request.tok.start
+    for start in range(0, num_rows, rows_per_chunk):
+        stop = min(start + rows_per_chunk, num_rows)
+        rows = slice(start, stop)
+        tok_c = slice(request.tok.start + start, request.tok.start + stop)
+        lens_c = request.lens[rows]
+        s = indexer.scores(q[tok_c], index_k, weights[tok_c], lengths=lens_c)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 
 

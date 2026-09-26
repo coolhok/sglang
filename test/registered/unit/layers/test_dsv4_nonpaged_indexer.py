@@ -42,6 +42,105 @@ _ISSUE_C4_COLS = 92992
 _ISSUE_ALIGNED_COLS = 93184
 
 
+class TestV41TorchPrefillRequests(CustomTestCase):
+    def test_cpu_lengths_define_contiguous_request_rows(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import PrefillInputs, scoring
+
+        ratio = 2
+        positions = torch.tensor([2, 3, 4, 2, 3])
+        q = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
+        weights = torch.ones((5, 1), dtype=torch.float32)
+        index_k = torch.arange(128, dtype=torch.float32).view(64, 2)
+        indexer = SimpleNamespace(
+            index_topk=2,
+            queries=lambda q_lora, _freqs: q_lora,
+            head_weights=lambda x: x,
+            scores=lambda q_rows, k_rows, w_rows, lengths: (
+                torch.einsum("bhd,nd->bhn", q_rows, k_rows)
+                .relu()
+                .mul(w_rows[..., None])
+                .sum(1)
+                .float()
+            ).masked_fill(
+                torch.arange(k_rows.shape[0])[None, :] >= lengths[:, None],
+                -torch.inf,
+            ),
+        )
+        pool = SimpleNamespace(
+            get_low_ratio_index_k_dequant=lambda _layer_id, slots: index_k[slots]
+        )
+        req_to_token = torch.tensor(
+            [
+                [20 + i for i in range(10)],
+                [40 + i for i in range(10)],
+                list(range(10)),
+            ]
+        )
+        inputs = PrefillInputs(
+            indexer=indexer,
+            layer_id=0,
+            compress_ratio=ratio,
+            freqs_cis=torch.zeros((8, 1)),
+            x=weights,
+            q_lora=q,
+            positions=positions,
+            req_rows=torch.tensor([2, 2, 2, 0, 0]),
+            req_pool_indices=torch.tensor([2, 1, 0]),
+            kv_page_table=torch.empty((0, 0), dtype=torch.int32),
+            seq_lens_cpu=[5, 7, 4],
+            rows_per_request=[3, 0, 2],
+            rows_per_request_device=torch.tensor([3, 0, 2]),
+        )
+        out = scoring.Selection(
+            page_indices=torch.full((5, 2), -1, dtype=torch.int32),
+            raw_indices=torch.full((5, 2), -1, dtype=torch.int32),
+        )
+
+        with (
+            patch.object(torch, "unique_consecutive", side_effect=AssertionError),
+            patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", 4),
+        ):
+            requests = [
+                (request, list(chunks))
+                for request, chunks in scoring.prefill_requests(
+                    inputs=inputs,
+                    out=out,
+                    token_to_kv_pool=pool,
+                    req_to_token=req_to_token,
+                )
+            ]
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            [(r.tok.start, r.tok.stop, r.lc) for r, _ in requests],
+            [(0, 3, 2), (3, 5, 2)],
+        )
+        self.assertEqual(
+            [[(c.tok.start, c.tok.stop) for c in chunks] for _, chunks in requests],
+            [[(0, 1), (1, 2), (2, 3)], [(3, 4), (4, 5)]],
+        )
+        torch.testing.assert_close(requests[0][0].slots, torch.tensor([0, 1]))
+        torch.testing.assert_close(requests[1][0].slots, torch.tensor([10, 11]))
+        for request, chunks in requests:
+            for chunk in chunks:
+                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                scoring.write_prefill(out, request, chunk, idx)
+        torch.testing.assert_close(
+            out.page_indices,
+            torch.tensor(
+                [[0, -1], [0, 1], [0, 1], [10, -1], [10, 11]],
+                dtype=torch.int32,
+            ),
+        )
+        torch.testing.assert_close(
+            out.raw_indices,
+            torch.tensor(
+                [[0, -1], [0, 1], [0, 1], [0, -1], [0, 1]],
+                dtype=torch.int32,
+            ),
+        )
+
+
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)

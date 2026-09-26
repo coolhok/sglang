@@ -15,10 +15,12 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    dequant_fp4_index_k_cache,
     fp4_index_logits_decode,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
+from sglang.kernels.ops.attention.dsv4.index_logits import index_score_epilogue
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -37,6 +39,86 @@ SCALE_GROUPS = HEAD_DIM // GROUP_SIZE
 SCALE_BYTES = 4
 PAGE_SIZE = 64
 E2M1_MAX = 6.0
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="CUDA-only index score kernel")
+@pytest.mark.parametrize(
+    "rows,width",
+    [
+        (0, 0),
+        (1, 1),
+        (7, 65),
+        (13, 257),
+        (64, 4096),
+        (128, 8192),
+        (128, 8200),
+    ],
+)
+def test_index_score_epilogue(rows: int, width: int) -> None:
+    torch.manual_seed(rows + width)
+    scores = torch.randn(rows, 32, width, device=get_device(), dtype=torch.bfloat16)
+    weights = torch.randn(rows, 32, device=get_device(), dtype=torch.bfloat16)
+
+    actual = index_score_epilogue(scores, weights)
+    expected = (scores.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    assert actual.shape == (rows, width)
+    assert actual.dtype == torch.float32
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="CUDA-only index score kernel")
+@pytest.mark.parametrize(
+    "rows,width,lengths_dtype",
+    [
+        (7, 65, torch.int64),
+        (128, 8192, torch.int32),
+        (128, 8200, torch.int64),
+    ],
+)
+def test_index_score_epilogue_length_mask(
+    rows: int, width: int, lengths_dtype: torch.dtype
+) -> None:
+    torch.manual_seed(rows + width + 1)
+    scores = torch.randn(rows, 32, width, device=get_device(), dtype=torch.bfloat16)
+    weights = torch.randn(rows, 32, device=get_device(), dtype=torch.bfloat16)
+    lengths_storage = torch.empty(rows * 2, device=get_device(), dtype=lengths_dtype)
+    lengths_storage[::2] = torch.linspace(0, width, rows, device=get_device())
+    lengths = lengths_storage[::2]
+
+    unmasked = index_score_epilogue(scores, weights)
+    actual = index_score_epilogue(scores, weights, lengths)
+    columns = torch.arange(width, device=get_device())
+    expected = unmasked.masked_fill(columns[None, :] >= lengths[:, None], -torch.inf)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="CUDA-only index score kernel")
+def test_index_score_epilogue_noncontiguous_inputs() -> None:
+    scores = torch.randn(7, 32, 130, device=get_device(), dtype=torch.bfloat16)[
+        :, :, ::2
+    ]
+    weights = torch.randn(7, 64, device=get_device(), dtype=torch.bfloat16)[:, ::2]
+
+    actual = index_score_epilogue(scores, weights)
+    expected = (scores.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
+
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="CUDA-only index score kernel")
+def test_index_score_epilogue_nonfinite_scores() -> None:
+    scores = torch.zeros(1, 32, 3, device=get_device(), dtype=torch.bfloat16)
+    scores[0, 0] = torch.tensor(
+        [-torch.inf, torch.inf, torch.nan], device=scores.device
+    )
+    weights = torch.ones(1, 32, device=scores.device, dtype=torch.bfloat16)
+
+    actual = index_score_epilogue(scores, weights)
+    expected = (scores.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
+
+    torch.testing.assert_close(actual, expected, equal_nan=True)
 
 
 def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
@@ -98,6 +180,95 @@ def _ref_store_fp4_index_cache(
             (x_sf[token_id] >> sf_shifts) & 0xFF
         ).to(torch.uint8)
     return expected
+
+
+def _ref_dequant_fp4_index_cache(
+    cache: torch.Tensor, slots: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    slots = slots.to(torch.int64)
+    page, offset = slots // page_size, slots % page_size
+    pair = torch.arange(FP4_DIM, device=cache.device)
+    payload = cache[page[:, None], offset[:, None] * FP4_DIM + pair[None, :]]
+    codes = torch.stack((payload & 0x0F, payload >> 4), dim=-1).flatten(1).long()
+    levels = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=cache.device)
+    values = levels[codes & 7]
+    values = torch.where((codes & 8) != 0, -values, values)
+    scale_index = torch.arange(SCALE_BYTES, device=cache.device)
+    exponents = cache[
+        page[:, None],
+        page_size * FP4_DIM + offset[:, None] * SCALE_BYTES + scale_index[None, :],
+    ].int()
+    scales = torch.ldexp(
+        torch.ones_like(exponents, dtype=torch.float32), exponents - 127
+    )
+    return (values * scales.repeat_interleave(GROUP_SIZE, dim=-1)).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "num_rows,page_size",
+    [(0, 64), (1, 256), (7, 64), (64, 256), (257, 64), (1024, 256)],
+)
+@pytest.mark.parametrize("slots_dtype", [torch.int32, torch.int64])
+def test_dequant_fp4_index_k_cache(
+    num_rows: int, page_size: int, slots_dtype: torch.dtype
+) -> None:
+    torch.manual_seed(9100 + num_rows)
+    num_pages = max(2, (num_rows + page_size - 1) // page_size * 2)
+    cache = torch.randint(
+        0,
+        256,
+        (num_pages, page_size * (FP4_DIM + SCALE_BYTES)),
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    cache[:, page_size * FP4_DIM :] = torch.randint(
+        120,
+        136,
+        (num_pages, page_size * SCALE_BYTES),
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    slots_storage = torch.zeros(
+        max(1, num_rows * 2), device=get_device(), dtype=slots_dtype
+    )
+    slots_storage[: num_rows * 2 : 2] = torch.randperm(
+        num_pages * page_size, device=get_device()
+    )[:num_rows]
+    slots = slots_storage[: num_rows * 2 : 2]
+
+    actual = dequant_fp4_index_k_cache(cache, slots, page_size=page_size)
+    expected = _ref_dequant_fp4_index_cache(cache, slots, page_size)
+
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(_is_xpu, reason="CUDA graph replay requires a CUDA device")
+def test_dequant_fp4_index_k_cache_graph_replay() -> None:
+    num_rows = 257
+    num_pages = 10
+    page_size = 256
+    cache = torch.randint(
+        0,
+        256,
+        (num_pages, page_size * (FP4_DIM + SCALE_BYTES)),
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    slots = torch.randperm(num_pages * page_size, device=get_device())[:num_rows].to(
+        torch.int64
+    )
+    for _ in range(3):
+        dequant_fp4_index_k_cache(cache, slots, page_size=page_size)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = dequant_fp4_index_k_cache(cache, slots, page_size=page_size)
+    for step in range(3):
+        cache.random_(0, 256)
+        cache[:, page_size * FP4_DIM :].random_(120, 136)
+        slots.copy_(slots.roll(step + 1))
+        graph.replay()
+        expected = _ref_dequant_fp4_index_cache(cache, slots, page_size)
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 96])

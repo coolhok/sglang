@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Iterator, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
@@ -15,6 +17,97 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
+
+
+@triton.jit
+def _index_score_epilogue_kernel(
+    scores,
+    weights,
+    lengths,
+    out,
+    width,
+    stride_sb,
+    stride_sh,
+    stride_sn,
+    stride_wb,
+    stride_wh,
+    stride_l,
+    stride_ob,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    APPLY_LENGTH_MASK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    heads = tl.arange(0, BLOCK_H)
+    valid = (heads[:, None] < H) & (columns[None, :] < width)
+    score = tl.load(
+        scores
+        + row * stride_sb
+        + heads[:, None] * stride_sh
+        + columns[None, :] * stride_sn,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    weight = tl.load(
+        weights + row * stride_wb + heads * stride_wh,
+        mask=heads < H,
+        other=0.0,
+    ).to(tl.float32)
+    relu = tl.maximum(score, 0.0, propagate_nan=tl.PropagateNan.ALL)
+    products = (relu * weight[:, None]).to(tl.bfloat16)
+    logits = tl.sum(products.to(tl.float32), axis=0).to(tl.bfloat16)
+    if APPLY_LENGTH_MASK:
+        length = tl.load(lengths + row * stride_l)
+        logits = tl.where(columns < length, logits, -float("inf"))
+    tl.store(out + row * stride_ob + columns, logits, mask=columns < width)
+
+
+def index_score_epilogue(
+    scores: torch.Tensor,
+    weights: torch.Tensor,
+    lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply ReLU, per-head weights, reduction, and an optional length mask."""
+    assert scores.ndim == 3 and weights.shape == scores.shape[:2]
+    assert scores.dtype == weights.dtype == torch.bfloat16
+    assert scores.is_cuda and weights.is_cuda and scores.device == weights.device
+    rows, heads, width = scores.shape
+    if lengths is not None:
+        assert lengths.ndim == 1 and lengths.shape[0] == rows
+        assert lengths.dtype in (torch.int32, torch.int64)
+        assert lengths.is_cuda and lengths.device == scores.device
+    out = torch.empty((rows, width), dtype=torch.float32, device=scores.device)
+    if rows and width:
+        score_elements = rows * width
+        # Wider tiles reduce launch and MIO pressure, but a small masked tail can
+        # dominate; retain the narrower launch for small or poorly aligned scores.
+        use_wide_tile = score_elements >= 262_144 and width % 256 == 0
+        block_n = 512 if use_wide_tile else 256
+        launch_meta = {"num_warps": 2 if use_wide_tile else 4}
+        if use_wide_tile and score_elements >= 1_048_576:
+            launch_meta["maxnreg"] = 72
+        _index_score_epilogue_kernel[(rows, triton.cdiv(width, block_n))](
+            scores,
+            weights,
+            lengths if lengths is not None else weights,
+            out,
+            width,
+            scores.stride(0),
+            scores.stride(1),
+            scores.stride(2),
+            weights.stride(0),
+            weights.stride(1),
+            lengths.stride(0) if lengths is not None else 0,
+            out.stride(0),
+            H=heads,
+            BLOCK_H=triton.next_power_of_2(heads),
+            BLOCK_N=block_n,
+            APPLY_LENGTH_MASK=lengths is not None,
+            **launch_meta,
+        )
+    return out
 
 
 def flat_index_logits_rows_per_tile(

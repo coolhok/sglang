@@ -258,9 +258,27 @@ class DeepseekV41Indexer(nn.Module):
         return self.head_weights_raw(x) * self.head_weight_scale
 
     def scores(
-        self, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
+        """q [t, H, d], k [n, d], weights [t, H] -> [t, n] scores, optionally masked."""
         s = torch.einsum("bhd,nd->bhn", q, k)
+        if (
+            s.is_cuda
+            and torch.version.cuda is not None
+            and s.dtype == weights.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.attention.dsv4.index_logits import (
+                index_score_epilogue,
+            )
+
+            return index_score_epilogue(s, weights, lengths)
         s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
-        return s.float()
+        s = s.float()
+        if lengths is not None:
+            columns = torch.arange(k.shape[0], device=s.device)
+            s = s.masked_fill(columns[None, :] >= lengths[:, None], -torch.inf)
+        return s

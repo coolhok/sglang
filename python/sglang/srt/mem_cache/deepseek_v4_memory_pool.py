@@ -699,12 +699,19 @@ class DeepSeekV4IndexerPool(KVCache):
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool."""
-        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
-
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
             slots = torch.arange(self.size, device=buf.device)
+        if get_platform().is_cuda:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                dequant_fp4_index_k_cache,
+            )
+
+            return dequant_fp4_index_k_cache(buf, slots, page_size=self.page_size)
+
+        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
         slots = slots.to(torch.int64)
         # Page layout: see get_index_k_fp4.
         p = self.page_size
