@@ -196,6 +196,40 @@ def picks(positions: torch.Tensor, row: int) -> set:
 )
 class TestPrefillSparseIndexer(CustomTestCase):
     @torch.inference_mode()
+    def test_sparse_topk_fuses_request_offsets(self):
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_sparse
+
+        rows, width = 4, 1024
+        torch.manual_seed(1)
+        logits = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
+        valid_lens = torch.tensor(
+            [0, 127, 512, width], device="cuda", dtype=torch.int32
+        )
+        blocks = (
+            torch.arange(width // BLOCK, device="cuda", dtype=torch.int32)
+            .expand(rows, -1)
+            .contiguous()
+        )
+        offsets = torch.tensor([11, 1000, 2000, 3000], device="cuda", dtype=torch.int32)
+        baseline = torch.empty(rows, TOPK, device="cuda", dtype=torch.int32)
+        fused = torch.empty_like(baseline)
+
+        topk_transform_sparse(logits, valid_lens, blocks, baseline)
+        topk_transform_sparse(
+            logits,
+            valid_lens,
+            blocks,
+            fused,
+            out_offsets=offsets,
+        )
+        expected = torch.where(baseline >= 0, baseline + offsets[:, None], baseline)
+        # The radix kernel returns an unordered set; independent launches may
+        # stage equal-score entries in a different order.
+        self.assertTrue(
+            torch.equal(fused.sort(dim=1).values, expected.sort(dim=1).values)
+        )
+
+    @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):
         """The published blocks equal `select_candidate_block_ids` block for block
         (ragged lengths, an empty row, block counts above and below 2048), and the

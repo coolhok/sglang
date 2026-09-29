@@ -74,7 +74,13 @@ def _jit_topk_bf16_small_module():
         make_name("topk_bf16_small"),
         *args,
         cuda_files=["deepseek_v4/topk_bf16_small.cuh"],
-        cuda_wrappers=[("topk_transform", f"TopKBF16Kernel<{args}>::transform")],
+        cuda_wrappers=[
+            ("topk_transform", f"TopKBF16Kernel<{args}>::transform"),
+            (
+                "topk_transform_with_offsets",
+                f"TopKBF16Kernel<{args}>::transform_with_offsets",
+            ),
+        ],
     )
 
 
@@ -84,6 +90,7 @@ def topk_transform_bf16_small(
     page_table: torch.Tensor,
     out_page_indices: torch.Tensor,
     page_size: int,
+    row_offsets: Optional[torch.Tensor] = None,
 ) -> None:
     """bf16 top-k for rows of at most 16384 scores (the DeepSeek-V4.1 sparse
     indexer's consumer rows), fused with a page-table transform.
@@ -96,9 +103,18 @@ def topk_transform_bf16_small(
     bf16 bytes locate the k-th largest value); which of the elements equal to
     it fill the last slots is arbitrary. NaN scores are not supported.
     """
-    _jit_topk_bf16_small_module().topk_transform(
-        scores, seq_lens, page_table, out_page_indices, page_size
-    )
+    module = _jit_topk_bf16_small_module()
+    if row_offsets is None:
+        module.topk_transform(scores, seq_lens, page_table, out_page_indices, page_size)
+    else:
+        module.topk_transform_with_offsets(
+            scores,
+            seq_lens,
+            page_table,
+            row_offsets,
+            out_page_indices,
+            page_size,
+        )
 
 
 def topk_transform_paged(
@@ -333,11 +349,20 @@ def topk_transform_sparse(
     valid_lens: torch.Tensor,
     blocks: torch.Tensor,
     out_indices: torch.Tensor,
+    *,
+    out_offsets: Optional[torch.Tensor] = None,
 ) -> None:
     """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
     ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
-    published blocks as pool slots / 8, compressed positions for logical ids."""
+    published blocks as pool slots / 8, compressed positions for logical ids.
+    When ``out_offsets`` is given, its per-row value is added to every valid
+    selected position in the same kernel; ``-1`` padding is unchanged."""
     topk_transform_bf16_small(
-        logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+        logits,
+        valid_lens,
+        blocks,
+        out_indices,
+        CANDIDATE_BLOCK_SIZE,
+        out_offsets,
     )

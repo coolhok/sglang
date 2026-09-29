@@ -77,6 +77,7 @@ struct TopKBF16Params {
   const bf16_t* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
+  const int32_t* __restrict__ row_offsets;
   int32_t* __restrict__ page_indices;
   int64_t score_stride;
   int64_t page_table_stride;
@@ -173,7 +174,7 @@ SGL_DEVICE uint32_t topk_bf16_pack_hits(const uint32_t (&m)[4]) {
   return __dp4a(static_cast<int>(hi), static_cast<int>(0x80C0E0F0u), nib);          // -16..-128
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kAddRowOffsets>
 __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupancy)  //
     void topk_bf16_small_kernel(const __grid_constant__ TopKBF16Params params) {
   using namespace device;
@@ -193,7 +194,12 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   const auto page_bits = params.page_bits;
   const auto page_mask = (1u << page_bits) - 1;
   const auto transform = [&](uint32_t idx) -> int32_t {
-    return (table[idx >> page_bits] << page_bits) | static_cast<int32_t>(idx & page_mask);
+    const auto mapped = (table[idx >> page_bits] << page_bits) | static_cast<int32_t>(idx & page_mask);
+    if constexpr (kAddRowOffsets) {
+      return mapped + params.row_offsets[bx];
+    } else {
+      return mapped;
+    }
   };
 
   {
@@ -380,11 +386,14 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
 /// | (i & mask)`, -1 past min(topk, seq_len).
 template <bool kPDL>
 struct TopKBF16Kernel {
-  static void transform(
+ private:
+  template <bool kAddRowOffsets>
+  static void transform_impl(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
+      const tvm::ffi::TensorView* row_offsets,
       const uint32_t page_size) {
     using namespace host;
     using C = TopKBF16Config;
@@ -414,6 +423,12 @@ struct TopKBF16Kernel {
         .with_dtype<int32_t>()
         .with_device(device_)
         .verify(page_indices);
+    if constexpr (kAddRowOffsets) {
+      TensorMatcher({B})  // row_offsets
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(*row_offsets);
+    }
     CHECK_HOST(std::has_single_bit(page_size)) << "page_size must be a power of 2";
     CHECK_HOST(L.unwrap() <= C::kMaxSeqLen) << "rows longer than kMaxSeqLen take the streaming top-k";
     /// NOTE: a row base must stay aligned to the vector width, not just the tensor base.
@@ -424,6 +439,7 @@ struct TopKBF16Kernel {
         .scores = static_cast<const bf16_t*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
+        .row_offsets = kAddRowOffsets ? static_cast<const int32_t*>(row_offsets->data_ptr()) : nullptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = page_table.stride(0),
@@ -433,7 +449,27 @@ struct TopKBF16Kernel {
     };
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), C::kBlockSize, device_.unwrap())
         .config({.use_pdl = kPDL})
-        .launch(topk_bf16_small_kernel<kPDL>, params);
+        .launch(topk_bf16_small_kernel<kPDL, kAddRowOffsets>, params);
+  }
+
+ public:
+  static void transform(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size) {
+    transform_impl<false>(scores, seq_lens, page_table, page_indices, nullptr, page_size);
+  }
+
+  static void transform_with_offsets(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::TensorView row_offsets,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size) {
+    transform_impl<true>(scores, seq_lens, page_table, page_indices, &row_offsets, page_size);
   }
 };
 

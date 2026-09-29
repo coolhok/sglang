@@ -445,5 +445,10 @@ def select_prefill_table(
         table.blocks.shape[1],
     )
     # request-relative compressed positions, -1 padded
-    topk_transform_sparse(logits, table.valid_lens, table.blocks, out_positions)
-    out_positions.add_(torch.where(out_positions >= 0, data.request_starts[:, None], 0))
+    topk_transform_sparse(
+        logits,
+        table.valid_lens,
+        table.blocks,
+        out_positions,
+        out_offsets=data.request_starts,
+    )
