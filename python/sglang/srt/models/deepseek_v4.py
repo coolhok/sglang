@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
+from sglang.srt.layers.cp.base import is_interleave
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
@@ -4679,17 +4680,20 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+            if get_parallel().pp_group.world_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
+                )
+            if get_parallel().attn_cp_size > 1 and not (
+                _is_cuda and is_interleave() and get_moe_a2a_backend().is_none()
+            ):
+                raise ValueError(
+                    "V4.1 vision context parallelism requires CUDA, the interleave "
+                    "strategy and --moe-a2a-backend none"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
