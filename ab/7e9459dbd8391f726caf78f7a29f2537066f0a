@@ -1,0 +1,27 @@
+python/sglang/srt/models/deepseek_v4.py
+  s_052d5269466f95::t_c3f6813b440966 76,4683-4685,4688,4691-4696
+  s_052d5269466f95::t_c638cf9289377b 4697
+python/sglang/srt/model_executor/runner/eager_runner.py
+  s_052d5269466f95::t_c3f6813b440966 354,361-365,367,377,420
+test/registered/unit/models/test_deepseek_v41_bcg_multimodal.py
+  s_052d5269466f95::t_2d9854413238e6 1,5,10,12-13,21,28-54,57-86,90-91,95-96,100
+  s_052d5269466f95::t_e2ee6199f787a1 15-16
+  s_052d5269466f95::t_448f5e3411535c 55-56,87-89,92-94,97-99
+  s_052d5269466f95::t_fd50f954a9eb6a 101-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ab7e9459dbd8391f726caf78f7a29f2537066f0a",
+  "prompts": {},
+  "sessions": {
+    "s_052d5269466f95": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19f37-1b74-7cd0-b12a-f7f25fdbe5bd",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "wuyu <839945306@qq.com>"
+    }
+  }
+}
